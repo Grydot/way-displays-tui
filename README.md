@@ -10,3 +10,4 @@ Things to work on.
 -Display Order.
 -Arranging Displays.
 -Code Cleanup
+-VRR, I have no displays that support VRR so I am unable to test fully.
