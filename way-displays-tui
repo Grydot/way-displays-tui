@@ -1,0 +1,858 @@
+#!/usr/bin/env python3
+import curses
+import subprocess
+import os
+import time
+
+# Version: 0.0.1
+# Author: Grydot (https://github.com/Grydot)
+# -*- coding: utf-8 -*-
+
+# --- Logfile setup ---
+LOGFILE_PATH = "~/.config/way-displays-tui/way-displays-tui.log"
+FALLBACK_LOGFILE_PATH = os.path.expanduser("~/way-displays-tui.log")
+
+def ensure_logfile_writable(stdscr):
+    log_dir = os.path.dirname(LOGFILE_PATH)
+    try:
+        # Create directory if it doesn't exist
+        if not os.path.exists(log_dir):
+            os.makedirs(log_dir, exist_ok=True)
+        # Test if logfile is writable
+        with open(LOGFILE_PATH, "a") as f:
+            f.write("")  # Test write
+        return LOGFILE_PATH
+    except (PermissionError, OSError):
+        # Fallback to user home directory
+        try:
+            with open(FALLBACK_LOGFILE_PATH, "a") as f:
+                f.write("")
+            draw_status_message(stdscr, f"Warning: Cannot write to {LOGFILE_PATH}. Using {FALLBACK_LOGFILE_PATH} instead.", is_error=True)
+            return FALLBACK_LOGFILE_PATH
+        except Exception as e:
+            draw_status_message(stdscr, f"Error: Cannot write to any logfile: {str(e)}", is_error=True)
+            return None
+
+# --- Utility functions ---
+
+def detect_lid_path():
+    base_path = "/proc/acpi/button/lid/"
+    try:
+        lids = [d for d in os.listdir(base_path) if os.path.isdir(os.path.join(base_path, d))]
+        if lids:
+            return os.path.join(base_path, lids[0], "state")
+    except Exception:
+        pass
+    return None
+
+def read_lid_state(lid_path):
+    if not lid_path:
+        return "unknown"
+    try:
+        with open(lid_path) as f:
+            state = f.read().strip()
+        return "closed" if "closed" in state else "open"
+    except Exception:
+        return "unknown"
+
+def run_cmd(cmd, log_file):
+    try:
+        output = subprocess.check_output(cmd, shell=True, text=True, stderr=subprocess.STDOUT)
+        if log_file:
+            with open(log_file, "a") as f:
+                f.write(f"Output of '{cmd}': {output}\n")
+        return output.strip()
+    except subprocess.CalledProcessError as e:
+        if log_file:
+            with open(log_file, "a") as f:
+                f.write(f"Error running '{cmd}': {e.output}\n")
+        return ""
+    except Exception as e:
+        if log_file:
+            with open(log_file, "a") as f:
+                f.write(f"Exception running '{cmd}': {str(e)}\n")
+        return ""
+
+def write_config(log_file):
+    cmd = "way-displays -w"
+    if log_file:
+        with open(log_file, "a") as f:
+            f.write(f"Executing write_config: {cmd}\n")
+    try:
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        if result.returncode != 0:
+            if log_file:
+                with open(log_file, "a") as f:
+                    f.write(f"Error writing config: {result.stderr}\n")
+            return False
+        else:
+            if log_file:
+                with open(log_file, "a") as f:
+                    f.write(f"Successfully wrote config to cfg.yaml: {result.stdout}\n")
+            return True
+    except Exception as e:
+        if log_file:
+            with open(log_file, "a") as f:
+                f.write(f"Exception writing config: {str(e)}\n")
+        return False
+
+# --- Way-Displays functions ---
+
+def parse_waydisplays_get(log_file):
+    output = run_cmd("way-displays -g", log_file)
+    if log_file:
+        with open(log_file, "a") as f:
+            f.write(f"way-displays -g output:\n{output}\n")
+    displays = {}
+    current = None
+    inside_info = False
+    inside_current = False
+
+    for line in output.splitlines():
+        line = line.rstrip()
+        if not line:
+            continue
+
+        # Detect monitor section start: e.g. DP-4:
+        if line.endswith(":") and not line.startswith(" "):
+            current = line[:-1]
+            displays[current] = {
+                'modes': [],
+                'scale': 1.0,
+                'position': (0, 0),
+                'mode': None,
+                'transform': 'normal',
+                'disabled': False,
+                'vrr': None,
+            }
+            inside_info = False
+            inside_current = False
+            continue
+
+        if current is None:
+            continue
+
+        # Detect info and current blocks inside monitor
+        if line.strip() == "info:":
+            inside_info = True
+            inside_current = False
+            continue
+        elif line.strip() == "current:":
+            inside_current = True
+            inside_info = False
+            continue
+
+        # Parse info block for modes (multiple lines)
+        if inside_info:
+            if line.strip().startswith("mode:"):
+                mode_line = line.strip()[5:].strip()
+                try:
+                    parts = mode_line.split("@")
+                    res_part = parts[0].strip()
+                    freq_part = parts[1].split()[0] if len(parts) > 1 else None
+                    width_height = res_part.replace(" ", "").split("x")
+                    width = int(width_height[0])
+                    height = int(width_height[1])
+                    if freq_part:
+                        freq = int(float(freq_part))  # Ensure integer refresh rate
+                        mode_str = f"{width}x{height}@{freq}"
+                    else:
+                        mode_str = f"{width}x{height}"
+                    if mode_str not in displays[current]['modes']:
+                        displays[current]['modes'].append(mode_str)
+                except Exception:
+                    pass
+
+        # Parse current block for actual settings
+        if inside_current:
+            line_strip = line.strip()
+            if log_file:
+                with open(log_file, "a") as f:
+                    f.write(f"Parsing current line for {current}: {line_strip}\n")
+            if line_strip == "(disabled)":
+                displays[current]['disabled'] = True
+                if log_file:
+                    with open(log_file, "a") as f:
+                        f.write(f"Detected (disabled) for {current}\n")
+            elif line_strip.startswith("scale:"):
+                parts = line_strip.split()
+                try:
+                    scale_val = float(parts[1])
+                    displays[current]['scale'] = scale_val
+                except Exception:
+                    pass
+            elif line_strip.startswith("position:"):
+                pos_str = line_strip.split()[1]
+                try:
+                    x_str, y_str = pos_str.split(",")
+                    displays[current]['position'] = (int(x_str), int(y_str))
+                except Exception:
+                    pass
+            elif line_strip.startswith("mode:"):
+                mode_info = line_strip[5:].strip()
+                try:
+                    mode_info_clean = mode_info.split()[0]
+                    mode_info_clean = mode_info_clean.replace("Hz", "")
+                    displays[current]['mode'] = mode_info_clean
+                except Exception:
+                    pass
+            elif line_strip.startswith("transform:"):
+                tr_val = line_strip.split()[1]
+                if tr_val == "0":
+                    tr_val = 'normal'
+                displays[current]['transform'] = tr_val
+            elif line_strip.startswith("VRR:"):
+                vrr_val = line_strip.split()[1]
+                displays[current]['vrr'] = vrr_val
+            elif line_strip.startswith("disabled:"):
+                disabled_val = line_strip.split()[1]
+                displays[current]['disabled'] = disabled_val == "yes"
+                if log_file:
+                    with open(log_file, "a") as f:
+                        f.write(f"Parsed disabled state for {current}: {disabled_val}\n")
+
+    return displays
+
+def toggle_display(name, disable, log_file, retries=2):
+    cmd = f"way-displays -s DISABLED '{name}'" if disable else f"way-displays -d DISABLED '{name}'"
+    if log_file:
+        with open(log_file, "a") as f:
+            f.write(f"Executing toggle_display: {cmd} (disable={disable}, retries={retries})\n")
+    for attempt in range(retries):
+        try:
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            if result.returncode != 0:
+                if log_file:
+                    with open(log_file, "a") as f:
+                        f.write(f"Attempt {attempt + 1} failed for '{cmd}': {result.stderr}\n")
+                if attempt < retries - 1:
+                    time.sleep(0.5)
+                continue
+            else:
+                if log_file:
+                    with open(log_file, "a") as f:
+                        f.write(f"Successfully toggled {name} to {'disabled' if disable else 'enabled'}: {result.stdout}\n")
+                time.sleep(0.5)  # Increased delay to ensure Wayland applies change
+                if not write_config(log_file):
+                    if log_file:
+                        with open(log_file, "a") as f:
+                            f.write(f"Failed to write config after toggling {name}\n")
+                # Force state refresh
+                displays = parse_waydisplays_get(log_file)
+                if log_file:
+                    with open(log_file, "a") as f:
+                        f.write(f"State after toggle for {name}: disabled={displays.get(name, {}).get('disabled', 'unknown')}\n")
+                # Debug: Check state again after 2 seconds
+                time.sleep(2.0)
+                displays_after = parse_waydisplays_get(log_file)
+                if log_file:
+                    with open(log_file, "a") as f:
+                        f.write(f"State after 2s for {name}: disabled={displays_after.get(name, {}).get('disabled', 'unknown')}\n")
+                return True
+        except Exception as e:
+            if log_file:
+                with open(log_file, "a") as f:
+                    f.write(f"Exception in attempt {attempt + 1} for '{cmd}': {str(e)}\n")
+            if attempt < retries - 1:
+                time.sleep(0.5)
+    return False
+
+def set_scale(name, scale, log_file):
+    cmd = f"way-displays -s SCALE '{name}' {scale:.2f}"
+    if log_file:
+        with open(log_file, "a") as f:
+            f.write(f"Executing: {cmd}\n")
+    try:
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        if result.returncode != 0:
+            if log_file:
+                with open(log_file, "a") as f:
+                    f.write(f"Error setting scale for {name}: {result.stderr}\n")
+            return False
+        else:
+            if log_file:
+                with open(log_file, "a") as f:
+                    f.write(f"Successfully set scale for {name} to {scale:.2f}: {result.stdout}\n")
+            if not write_config(log_file):
+                if log_file:
+                    with open(log_file, "a") as f:
+                        f.write(f"Failed to write config after setting scale for {name}\n")
+            return True
+    except Exception as e:
+        if log_file:
+            with open(log_file, "a") as f:
+                f.write(f"Exception setting scale for {name}: {str(e)}\n")
+        return False
+
+def set_mode(name, mode_str, log_file):
+    parts = mode_str.split('@')
+    res_part = parts[0].strip()
+    width, height = res_part.split('x')
+    width = int(width.strip())
+    height = int(height.strip())
+    refresh = None
+    if len(parts) > 1:
+        refresh_part = parts[1].strip()
+        try:
+            refresh = float(refresh_part)
+        except Exception:
+            refresh = None
+    if refresh:
+        cmd = f"way-displays -s MODE '{name}' {width} {height} {refresh}"
+    else:
+        cmd = f"way-displays -s MODE '{name}' {width} {height}"
+    if log_file:
+        with open(log_file, "a") as f:
+            f.write(f"Executing: {cmd}\n")
+    try:
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        if result.returncode != 0:
+            if log_file:
+                with open(log_file, "a") as f:
+                    f.write(f"Error setting mode for {name}: {result.stderr}\n")
+            return False
+        else:
+            if log_file:
+                with open(log_file, "a") as f:
+                    f.write(f"Successfully set mode for {name} to {mode_str}: {result.stdout}\n")
+            if not write_config(log_file):
+                if log_file:
+                    with open(log_file, "a") as f:
+                        f.write(f"Failed to write config after setting mode for {name}\n")
+            return True
+    except Exception as e:
+        if log_file:
+            with open(log_file, "a") as f:
+                f.write(f"Exception setting mode for {name}: {str(e)}\n")
+        return False
+
+transform_names = {
+    'normal': 'Normal',
+    '90': 'Rotate 90°',
+    '180': 'Rotate 180°',
+    '270': 'Rotate 270°',
+    'flipped': 'Flipped',
+    'flipped-90': 'Flipped + Rotate 90°',
+    'flipped-180': 'Flipped + Rotate 180°',
+    'flipped-270': 'Flipped + Rotate 270°',
+}
+
+transform_names_reverse = {v: k for k, v in transform_names.items()}
+
+def set_transform(name, transform, log_file):
+    if transform == 'normal':
+        cmd = f"way-displays -d TRANSFORM '{name}'"
+    else:
+        cmd = f"way-displays -s TRANSFORM '{name}' {transform}"
+    if log_file:
+        with open(log_file, "a") as f:
+            f.write(f"Executing: {cmd}\n")
+    try:
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        if result.returncode != 0:
+            if log_file:
+                with open(log_file, "a") as f:
+                    f.write(f"Error setting transform for {name}: {result.stderr}\n")
+            return False
+        else:
+            if log_file:
+                with open(log_file, "a") as f:
+                    f.write(f"Successfully set transform for {name} to {transform}: {result.stdout}\n")
+            if not write_config(log_file):
+                if log_file:
+                    with open(log_file, "a") as f:
+                        f.write(f"Failed to write config after setting transform for {name}\n")
+            return True
+    except Exception as e:
+        if log_file:
+            with open(log_file, "a") as f:
+                f.write(f"Exception setting transform for {name}: {str(e)}\n")
+        return False
+
+def get_active_config():
+    try:
+        with open(cfg_path, "r") as f:
+            return f.read().splitlines()
+    except FileNotFoundError:
+        return []
+
+def save_active_config(lines):
+    with open(cfg_path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+# --- UI functions ---
+
+def draw_title_bar(stdscr, title):
+    h, w = stdscr.getmaxyx()
+    stdscr.attron(curses.color_pair(2))
+    stdscr.addstr(0, 0, " " * (w - 1))
+    stdscr.addstr(0, max(0, (w - len(title)) // 2), title)
+    stdscr.attroff(curses.color_pair(2))
+
+def draw_status_message(stdscr, message, is_error=False):
+    h, w = stdscr.getmaxyx()
+    stdscr.attron(curses.color_pair(3 if is_error else 1))
+    stdscr.addstr(h - 1, 0, message[:w - 1].ljust(w - 1))
+    stdscr.attroff(curses.color_pair(3 if is_error else 1))
+    stdscr.refresh()
+    time.sleep(1)  # Show message for 1 second
+
+def draw_menu(stdscr, title, options, selected):
+    stdscr.clear()
+    draw_title_bar(stdscr, "Way-Displays-TUI")
+    h, w = stdscr.getmaxyx()
+    stdscr.addstr(2, max(0, (w - len(title)) // 2), title, curses.A_BOLD)
+
+    for idx, opt in enumerate(options):
+        y = idx + 4
+        if y >= h - 1:
+            break
+        if idx == selected:
+            stdscr.attron(curses.color_pair(1))
+            stdscr.addstr(y, 4, opt)
+            stdscr.attroff(curses.color_pair(1))
+        else:
+            stdscr.addstr(y, 4, opt)
+    stdscr.refresh()
+
+def edit_active_config(stdscr, log_file):
+    lines = get_active_config()
+    if not lines:
+        lines = ["# Your way-displays config here"]
+
+    pos = 0
+    max_lines = curses.LINES - 4
+    while True:
+        stdscr.clear()
+        draw_title_bar(stdscr, "Active Config - Edit (Q to save and exit)")
+        h, w = stdscr.getmaxyx()
+        for idx, line in enumerate(lines[pos:pos + max_lines]):
+            stdscr.addstr(idx + 2, 2, line[:w - 4])
+        stdscr.refresh()
+
+        key = stdscr.getch()
+        if key in (ord('q'), ord('Q')):
+            save_active_config(lines)
+            if not write_config(log_file):
+                draw_status_message(stdscr, "Failed to write config after editing", is_error=True)
+            break
+        elif key == curses.KEY_DOWN and pos + max_lines < len(lines):
+            pos += 1
+        elif key == curses.KEY_UP and pos > 0:
+            pos -= 1
+
+def draw_monitors_list(stdscr, displays, selected):
+    stdscr.clear()
+    draw_title_bar(stdscr, "Monitors - Select a monitor and press Enter (Q to go back)")
+    h, w = stdscr.getmaxyx()
+
+    valid_monitors = [(name, info) for name, info in displays.items() if '-' in name and name != "Active configuration"]
+
+    for idx, (name, info) in enumerate(valid_monitors):
+        mode = info['mode'] or "unknown"
+        scale = info.get('scale', 1.0)
+        transform = transform_names.get(info.get('transform', 'normal'), info.get('transform', 'normal'))
+        disabled = info.get('disabled', False)
+        status = "Disabled" if disabled else "Enabled"
+        vrr = info.get('vrr', 'unknown')
+        line = f"{name:6} | {status:8} | Mode: {mode:20} | Scale: {scale:.2f} | Orientation: {transform} | VRR: {vrr}"
+        y = idx + 2
+        if y >= h - 1:
+            break
+        if idx == selected:
+            stdscr.attron(curses.color_pair(1))
+            stdscr.addstr(y, 2, line[:w - 4])
+            stdscr.attroff(curses.color_pair(1))
+        else:
+            stdscr.addstr(y, 2, line[:w - 4])
+    stdscr.refresh()
+
+def draw_monitor_detail(stdscr, name, info, selected):
+    stdscr.clear()
+    draw_title_bar(stdscr, f"Monitor: {name} (Enter to toggle/change, Q to go back)")
+    h, w = stdscr.getmaxyx()
+
+    lines = []
+
+    enabled_line = ("Enabled/Disabled", "Disabled" if info.get('disabled', False) else "Enabled")
+    lines.append(("Enabled/Disabled", enabled_line))
+
+    current_mode = info.get('mode', "unknown")
+    lines.append(("Current Mode", current_mode))
+
+    scale_str = f"{info.get('scale', 1.0):.2f}"
+    lines.append(("Scale", scale_str))
+
+    transform_code = info.get('transform', 'normal')
+    transform_friendly = transform_names.get(transform_code, transform_code)
+    lines.append(("Orientation", transform_friendly))
+
+    vrr = info.get('vrr', 'unknown')
+    lines.append(("VRR", vrr))
+
+    for idx, (key, val) in enumerate(lines):
+        y = idx + 2
+        if y >= h - 1:
+            break
+        line = f"{key:15}: {val}"
+        if idx == selected:
+            stdscr.attron(curses.color_pair(1))
+            stdscr.addstr(y, 2, line[:w - 4])
+            stdscr.attroff(curses.color_pair(1))
+        else:
+            stdscr.addstr(y, 2, line[:w - 4])
+
+    stdscr.refresh()
+    return lines
+
+def select_from_list(stdscr, title, options, current_idx=0, log_file=None):
+    curses.curs_set(0)
+    selected = current_idx
+    if log_file:
+        with open(log_file, "a") as f:
+            f.write(f"Entering select_from_list: title={title}, options={options}, current_idx={current_idx}\n")
+    while True:
+        stdscr.clear()
+        draw_title_bar(stdscr, title)
+        h, w = stdscr.getmaxyx()
+        for idx, opt in enumerate(options):
+            y = idx + 2
+            if y >= h - 1:
+                break
+            if idx == selected:
+                stdscr.attron(curses.color_pair(1))
+                stdscr.addstr(y, 4, str(opt)[:w - 8])
+                stdscr.attroff(curses.color_pair(1))
+            else:
+                stdscr.addstr(y, 4, str(opt)[:w - 8])
+        stdscr.refresh()
+
+        key = stdscr.getch()
+        if log_file:
+            with open(log_file, "a") as f:
+                f.write(f"Key pressed in select_from_list: {key}\n")
+        if key == curses.KEY_UP and selected > 0:
+            selected -= 1
+        elif key == curses.KEY_DOWN and selected < len(options) - 1:
+            selected += 1
+        elif key in (10, 13):  # Enter key
+            if log_file:
+                with open(log_file, "a") as f:
+                    f.write(f"Selected option: {options[selected]} at index {selected}\n")
+            return selected
+        elif key in (27, ord('q'), ord('Q')):
+            if log_file:
+                with open(log_file, "a") as f:
+                    f.write("Cancelled selection\n")
+            return None
+
+def lid_settings_menu(stdscr, lid_path, log_file):
+    selected = 0
+    options = ["Disable Laptop Screen on Lid Close: ", "Back"]
+    disable_on_lid_close = True
+
+    while True:
+        stdscr.clear()
+        draw_title_bar(stdscr, "Lid Settings (Q to go back)")
+        h, w = stdscr.getmaxyx()
+
+        lid_state = read_lid_state(lid_path)
+        stdscr.addstr(2, 2, f"Lid Current State: {lid_state}")
+
+        status = "Yes" if disable_on_lid_close else "No"
+        if selected == 0:
+            stdscr.addstr(4, 4, f"> {options[0]}{status}")
+        else:
+            stdscr.addstr(4, 4, f"  {options[0]}{status}")
+
+        if selected == 1:
+            stdscr.addstr(6, 4, "> Back")
+        else:
+            stdscr.addstr(6, 4, "  Back")
+
+        stdscr.refresh()
+        key = stdscr.getch()
+        if key == curses.KEY_UP:
+            selected = (selected - 1) % 2
+        elif key == curses.KEY_DOWN:
+            selected = (selected + 1) % 2
+        elif key in (10, 13):
+            if selected == 0:
+                disable_on_lid_close = not disable_on_lid_close
+            elif selected == 1:
+                return disable_on_lid_close
+        elif key in (ord('q'), ord('Q')):
+            return disable_on_lid_close
+
+def monitors_menu(stdscr, lid_path, disable_on_lid_close, log_file):
+    selected_monitor = 0
+    in_monitor_detail = False
+    selected_detail_line = 0
+
+    while True:
+        lid_state = read_lid_state(lid_path)
+        if log_file:
+            with open(log_file, "a") as f:
+                f.write(f"Lid state: {lid_state}, disable_on_lid_close: {disable_on_lid_close}\n")
+        displays = parse_waydisplays_get(log_file)
+        valid_monitor_names = [name for name, _ in displays.items() if '-' in name and name != "Active configuration"]
+
+        if not valid_monitor_names:
+            stdscr.clear()
+            draw_title_bar(stdscr, "Monitors - No monitors detected (Q to go back)")
+            stdscr.addstr(2, 2, "No valid monitors detected.")
+            stdscr.refresh()
+            key = stdscr.getch()
+            if key in (ord('q'), ord('Q')):
+                break
+            continue
+
+        # Temporarily disable lid state auto-toggle to isolate issue
+        # if 'eDP-1' in displays and disable_on_lid_close:
+        #     if lid_state == "closed" and not displays['eDP-1'].get('disabled', True):
+        #         if log_file:
+        #             with open(log_file, "a") as f:
+        #                 f.write(f"Lid closed, disabling eDP-1\n")
+        #         toggle_display('eDP-1', True, log_file)
+        #         displays = parse_waydisplays_get(log_file)
+        #     elif lid_state == "open" and displays['eDP-1'].get('disabled', False):
+        #         if log_file:
+        #             with open(log_file, "a") as f:
+        #                 f.write(f"Lid open, enabling eDP-1\n")
+        #         toggle_display('eDP-1', False, log_file)
+        #         displays = parse_waydisplays_get(log_file)
+
+        if not in_monitor_detail:
+            draw_monitors_list(stdscr, displays, selected_monitor)
+            key = stdscr.getch()
+            if log_file:
+                with open(log_file, "a") as f:
+                    f.write(f"Key pressed in monitors list: {key}\n")
+            if key == curses.KEY_UP and selected_monitor > 0:
+                selected_monitor -= 1
+            elif key == curses.KEY_DOWN and selected_monitor < len(valid_monitor_names) - 1:
+                selected_monitor += 1
+            elif key in (10, 13):
+                in_monitor_detail = True
+                selected_detail_line = 0
+                if log_file:
+                    with open(log_file, "a") as f:
+                        f.write(f"Entering monitor details for {valid_monitor_names[selected_monitor]}\n")
+            elif key in (ord('q'), ord('Q')):
+                break
+        else:
+            monitor_name = valid_monitor_names[selected_monitor]
+            monitor_info = displays[monitor_name]
+            lines = draw_monitor_detail(stdscr, monitor_name, monitor_info, selected_detail_line)
+            key = stdscr.getch()
+            if log_file:
+                with open(log_file, "a") as f:
+                    f.write(f"Key pressed in monitor details: {key}\n")
+            if key == curses.KEY_UP and selected_detail_line > 0:
+                selected_detail_line -= 1
+            elif key == curses.KEY_DOWN and selected_detail_line < len(lines) - 1:
+                selected_detail_line += 1
+            elif key in (ord('q'), ord('Q')):
+                in_monitor_detail = False
+                if log_file:
+                    with open(log_file, "a") as f:
+                        f.write("Returning to monitors list\n")
+            elif key in (10, 13):
+                line_key, line_val = lines[selected_detail_line]
+                if log_file:
+                    with open(log_file, "a") as f:
+                        f.write(f"Selected {line_key} for {monitor_name}\n")
+                if line_key == "Enabled/Disabled":
+                    new_disable = not monitor_info.get('disabled', False)
+                    if log_file:
+                        with open(log_file, "a") as f:
+                            f.write(f"Current state for {monitor_name}: disabled={monitor_info.get('disabled', False)}, mode={monitor_info.get('mode', 'none')}\n")
+                    success = toggle_display(monitor_name, new_disable, log_file)
+                    time.sleep(0.2)  # Delay to ensure state propagates
+                    displays = parse_waydisplays_get(log_file)
+                    monitor_info = displays.get(monitor_name, monitor_info)
+                    if log_file:
+                        with open(log_file, "a") as f:
+                            f.write(f"New state for {monitor_name}: disabled={monitor_info.get('disabled', False)}, mode={monitor_info.get('mode', 'none')}\n")
+                    if success:
+                        if not new_disable:  # Monitor enabled, ensure mode is set
+                            modes = monitor_info.get('modes', [])
+                            if not modes:
+                                if log_file:
+                                    with open(log_file, "a") as f:
+                                        f.write(f"No modes available for {monitor_name} after enabling\n")
+                                draw_status_message(stdscr, f"No modes available for {monitor_name}", is_error=True)
+                            else:
+                                if log_file:
+                                    with open(log_file, "a") as f:
+                                        f.write(f"Setting default mode for {monitor_name}: {modes[0]}\n")
+                                mode_success = set_mode(monitor_name, modes[0], log_file)
+                                displays = parse_waydisplays_get(log_file)
+                                monitor_info = displays.get(monitor_name, monitor_info)
+                                if not mode_success:
+                                    if log_file:
+                                        with open(log_file, "a") as f:
+                                            f.write(f"Failed to set default mode for {monitor_name}\n")
+                                    draw_status_message(stdscr, f"Failed to set default mode for {monitor_name}", is_error=True)
+                        draw_status_message(stdscr, f"Toggled {monitor_name} to {'Disabled' if new_disable else 'Enabled'}")
+                    else:
+                        draw_status_message(stdscr, f"Failed to toggle {monitor_name} to {'Disabled' if new_disable else 'Enabled'}", is_error=True)
+                    if not success or not write_config(log_file):
+                        draw_status_message(stdscr, f"Config write failed after toggling {monitor_name}", is_error=True)
+                elif line_key == "Current Mode":
+                    modes = monitor_info.get('modes', [])
+                    if not modes:
+                        if log_file:
+                            with open(log_file, "a") as f:
+                                f.write("No modes available for selection\n")
+                        draw_status_message(stdscr, "No modes available", is_error=True)
+                        continue
+                    if log_file:
+                        with open(log_file, "a") as f:
+                            f.write(f"Available modes for {monitor_name}: {modes}\n")
+                    try:
+                        current_idx = modes.index(monitor_info.get('mode'))
+                    except ValueError:
+                        current_idx = 0
+                    choice = select_from_list(stdscr, "Select mode", modes, current_idx, log_file)
+                    if choice is not None:
+                        if log_file:
+                            with open(log_file, "a") as f:
+                                f.write(f"Applying mode {modes[choice]} to {monitor_name}\n")
+                        success = set_mode(monitor_name, modes[choice], log_file)
+                        displays = parse_waydisplays_get(log_file)
+                        monitor_info = displays.get(monitor_name, monitor_info)
+                        if success:
+                            draw_status_message(stdscr, f"Set mode to {modes[choice]}")
+                        else:
+                            draw_status_message(stdscr, f"Failed to set mode to {modes[choice]}", is_error=True)
+                        if not write_config(log_file):
+                            draw_status_message(stdscr, f"Config write failed after setting mode", is_error=True)
+                    else:
+                        if log_file:
+                            with open(log_file, "a") as f:
+                                f.write("Mode selection cancelled\n")
+                elif line_key == "Scale":
+                    scales = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]
+                    current_scale = monitor_info.get('scale', 1.0)
+                    try:
+                        current_idx = scales.index(current_scale)
+                    except ValueError:
+                        current_idx = 2
+                    choice = select_from_list(stdscr, "Select scale", scales, current_idx, log_file)
+                    if choice is not None:
+                        if log_file:
+                            with open(log_file, "a") as f:
+                                f.write(f"Applying scale {scales[choice]} to {monitor_name}\n")
+                        success = set_scale(monitor_name, scales[choice], log_file)
+                        displays = parse_waydisplays_get(log_file)
+                        monitor_info = displays.get(monitor_name, monitor_info)
+                        if success:
+                            draw_status_message(stdscr, f"Set scale to {scales[choice]:.2f}")
+                        else:
+                            draw_status_message(stdscr, f"Failed to set scale to {scales[choice]:.2f}", is_error=True)
+                        if not write_config(log_file):
+                            draw_status_message(stdscr, f"Config write failed after setting scale", is_error=True)
+                    else:
+                        if log_file:
+                            with open(log_file, "a") as f:
+                                f.write("Scale selection cancelled\n")
+                elif line_key == "Orientation":
+                    options = list(transform_names.values())
+                    current_tr_code = monitor_info.get('transform', 'normal')
+                    if current_tr_code not in transform_names:
+                        current_tr_code = 'normal'
+                    current_tr = transform_names[current_tr_code]
+                    current_idx = options.index(current_tr) if current_tr in options else 0
+                    choice = select_from_list(stdscr, "Select orientation", options, current_idx, log_file)
+                    if choice is not None:
+                        if log_file:
+                            with open(log_file, "a") as f:
+                                f.write(f"Applying orientation {options[choice]} to {monitor_name}\n")
+                        success = set_transform(monitor_name, transform_names_reverse[options[choice]], log_file)
+                        displays = parse_waydisplays_get(log_file)
+                        monitor_info = displays.get(monitor_name, monitor_info)
+                        if success:
+                            draw_status_message(stdscr, f"Set orientation to {options[choice]}")
+                        else:
+                            draw_status_message(stdscr, f"Failed to set orientation to {options[choice]}", is_error=True)
+                        if not write_config(log_file):
+                            draw_status_message(stdscr, f"Config write failed after setting orientation", is_error=True)
+                    else:
+                        if log_file:
+                            with open(log_file, "a") as f:
+                                f.write("Orientation selection cancelled\n")
+                elif line_key == "VRR":
+                    current_vrr = monitor_info.get('vrr', 'off')
+                    cmd = f"way-displays -s VRR_OFF '{monitor_name}'" if current_vrr == 'off' else f"way-displays -d VRR_OFF '{monitor_name}'"
+                    if log_file:
+                        with open(log_file, "a") as f:
+                            f.write(f"Executing: {cmd}\n")
+                    try:
+                        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                        if result.returncode != 0:
+                            if log_file:
+                                with open(log_file, "a") as f:
+                                    f.write(f"Error setting VRR for {monitor_name}: {result.stderr}\n")
+                            draw_status_message(stdscr, f"Failed to set VRR", is_error=True)
+                        else:
+                            if log_file:
+                                with open(log_file, "a") as f:
+                                    f.write(f"Successfully set VRR for {monitor_name}: {result.stdout}\n")
+                            if not write_config(log_file):
+                                if log_file:
+                                    with open(log_file, "a") as f:
+                                        f.write(f"Failed to write config after setting VRR for {monitor_name}\n")
+                                draw_status_message(stdscr, f"Config write failed after setting VRR", is_error=True)
+                            draw_status_message(stdscr, f"Set VRR to {'off' if current_vrr == 'on' else 'on'}")
+                        displays = parse_waydisplays_get(log_file)
+                        monitor_info = displays.get(monitor_name, monitor_info)
+                    except Exception as e:
+                        if log_file:
+                            with open(log_file, "a") as f:
+                                f.write(f"Exception setting VRR for {monitor_name}: {str(e)}\n")
+                        draw_status_message(stdscr, f"Exception setting VRR: {str(e)}", is_error=True)
+
+def main_menu(stdscr):
+    curses.curs_set(0)
+    curses.init_pair(1, curses.COLOR_BLACK, curses.COLOR_CYAN)  # Highlight
+    curses.init_pair(2, curses.COLOR_WHITE, curses.COLOR_BLUE)  # Title bar
+    curses.init_pair(3, curses.COLOR_RED, curses.COLOR_WHITE)   # Error messages
+
+    log_file = ensure_logfile_writable(stdscr)
+
+    menu_items = [
+        "Monitors Settings",
+        "Lid Settings",
+        "WDT Settings (Edit Config File)",
+        "Quit"
+    ]
+
+    selected = 0
+    lid_path = detect_lid_path()
+    disable_on_lid_close = True
+
+    while True:
+        draw_menu(stdscr, "Main Menu", menu_items, selected)
+        key = stdscr.getch()
+
+        if key == curses.KEY_UP and selected > 0:
+            selected -= 1
+        elif key == curses.KEY_DOWN and selected < len(menu_items) - 1:
+            selected += 1
+        elif key in (10, 13):
+            if menu_items[selected] == "Monitors Settings":
+                monitors_menu(stdscr, lid_path, disable_on_lid_close, log_file)
+            elif menu_items[selected] == "Lid Settings":
+                disable_on_lid_close = lid_settings_menu(stdscr, lid_path, log_file)
+            elif menu_items[selected] == "WDT Settings (Edit Config File)":
+                edit_active_config(stdscr, log_file)
+            elif menu_items[selected] == "Quit":
+                break
+        elif key in (ord('q'), ord('Q')):
+            break
+
+cfg_path = os.path.expanduser("~/.config/way-displays/cfg.yaml")
+
+if __name__ == "__main__":
+    curses.wrapper(main_menu)
